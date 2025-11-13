@@ -4,6 +4,23 @@ import os
 import copy
 import time
 
+
+def _to_serializable(obj):
+    if isinstance(obj, dict):
+        return {key: _to_serializable(value) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [_to_serializable(value) for value in obj]
+    if isinstance(obj, tuple):
+        return [_to_serializable(value) for value in obj]
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.floating, np.integer)):
+        return obj.item()
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    return obj
+
+
 class Trainer():
     def __init__(self,
                  train_env,
@@ -80,7 +97,7 @@ class Trainer():
     def save_eval_config(self,directory):
         file = os.path.join(directory,"eval_configs.json")
         with open(file, "w+") as f:
-            json.dump(self.eval_config, f)
+            json.dump(_to_serializable(self.eval_config), f)
 
     def learn(self,
               total_timesteps,
