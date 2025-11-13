@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: marinenav_env
+Version: 0.0.1
+Requires-Dist: gym
+Dynamic: requires-dist
