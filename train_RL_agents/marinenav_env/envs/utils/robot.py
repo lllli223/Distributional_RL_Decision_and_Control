@@ -1,6 +1,7 @@
 import numpy as np
 import copy
 import heapq
+from .fast_dynamics import compute_motion_step_numba
 
 class Perception:
 
@@ -262,69 +263,25 @@ class Robot:
         u, v = velocity_b[0], velocity_b[1]
         r = self.velocity[2]
 
-        d = self.dtype
-
-        # 2) 科氏力 / 附加质量 / 非线性阻尼矩阵
-        C_RB = np.array(
-            [[0.0,      -self.m * r, 0.0],
-             [self.m*r,  0.0,        0.0],
-             [0.0,       0.0,        0.0]], dtype=d
+        # 2) 调用 Numba 加速的核心计算函数
+        u_r_new, v_r_new, r_new = compute_motion_step_numba(
+            self.mass_matrix_inv,
+            self.m,
+            self.xDotU, self.yDotV, self.yDotR, self.nDotV, self.nDotR,
+            self.xU, self.xUU, self.yV, self.yVV, self.yRV, self.yVR, self.yRR,
+            self.nV, self.nVV, self.nRV, self.nVR, self.nR, self.nRR,
+            u_r, v_r, u, v, r,
+            self.left_thrust, self.right_thrust,
+            self.left_pos, self.right_pos,
+            self.length, self.width,
+            self.dt
         )
 
-        C_A = np.array(
-            [[0.0, 0.0, self.yDotV * v_r + self.yDotR * r],
-             [0.0, 0.0, -self.xDotU * u_r],
-             [-self.yDotV * v_r - self.yDotR * r,
-              self.xDotU * u_r,
-              0.0]], dtype=d
-        )
-
-        D_n = -np.array(
-            [[self.xUU * abs(u_r), 0.0, 0.0],
-             [0.0,
-              self.yVV * abs(v_r) + self.yRV * abs(r),
-              self.yVR * abs(v_r) + self.yRR * abs(r)],
-             [0.0,
-              self.nVV * abs(v_r) + self.nRV * abs(r),
-              self.nVR * abs(v_r) + self.nRR * abs(r)]], dtype=d
-        )
-
-        N = C_A + self.D + D_n   # 总的非惯性/阻尼项
-
-        # 3) 推进器产生的力和力矩
-        F_x_left  = self.left_thrust  * np.cos(self.left_pos)
-        F_y_left  = self.left_thrust  * np.sin(self.left_pos)
-        M_x_left  = F_x_left *  self.width / 2.0
-        M_y_left  = -F_y_left * self.length / 2.0
-
-        F_x_right = self.right_thrust * np.cos(self.right_pos)
-        F_y_right = self.right_thrust * np.sin(self.right_pos)
-        M_x_right = -F_x_right * self.width / 2.0
-        M_y_right = -F_y_right * self.length / 2.0
-
-        F_x = F_x_left + F_x_right
-        F_y = F_y_left + F_y_right
-        M_n = M_x_left + M_y_left + M_x_right + M_y_right
-
-        tau_p = np.array([F_x, F_y, M_n], dtype=d)
-
-        # 4) 计算加速度：mass_matrix * acc = -C_RB V - N V_r + tau_p
-        V = np.array([u, v, r], dtype=d)
-        V_r = np.array([u_r, v_r, r], dtype=d)
-        b = -C_RB @ V - N @ V_r + tau_p
-
-        # （1）用预计算的逆
-        acc = self.mass_matrix_inv @ b
-        # （2）如果不想预计算，也可以：
-        # acc = np.linalg.solve(self.mass_matrix, b)
-
-        # 5) 应用加速度
-        V_r = V_r + acc * self.dt
-
-        # 6) 速度从 robot frame 投影回 world frame
+        # 3) 速度从 robot frame 投影回 world frame
+        V_r = np.array([u_r_new, v_r_new, r_new], dtype=self.dtype)
         R_wr, _ = self.get_robot_transform()
         v_world = R_wr @ V_r[:2]
-        self.velocity_r = np.array([v_world[0], v_world[1], V_r[2]], dtype=d)
+        self.velocity_r = np.array([v_world[0], v_world[1], V_r[2]], dtype=self.dtype)
 
     def check_collision(self,obj_x,obj_y,obj_r):
         d = self.compute_distance(obj_x,obj_y,obj_r)
