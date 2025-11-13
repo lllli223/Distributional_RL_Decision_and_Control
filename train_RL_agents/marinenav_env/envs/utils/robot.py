@@ -42,9 +42,11 @@ class Perception:
 
 class Robot:
 
-    def __init__(self,seed:int=0):
-        self.dt = 0.05 # discretized time step (second)
-        self.N = 10 # number of time step per action
+    def __init__(self, seed: int = 0, dt: float = 0.05, N: int = 10, dtype=np.float32):
+        self.dtype = dtype
+        self.dt = dt                 # 时间步长
+        self.N = N                   # 每个 action 内部物理子步
+
         self.perception = Perception(seed)
         
         # WAM-V 16 simulation model
@@ -132,7 +134,7 @@ class Robot:
         self.deactivated = False # deactivate the robot if it collides with any objects or reaches the goal
 
         self.init_theta = 0.0 # theta at initial position
-        self.init_velocity_r = np.array([0.0,0.0,0.0]) # relative velocity at initial position
+        self.init_velocity_r = np.zeros(3, dtype=self.dtype) # relative velocity at initial position
         
         self.init_left_pos = 0.0 # left thruster angle at initial position
         self.init_right_pos = 0.0 # right thruster angle at initial position
@@ -150,13 +152,32 @@ class Robot:
         return len(self.actions)
     
     def compute_constant_matrices(self):
-        self.M_RB = np.matrix([[self.m,0.0,0.0],[0.0,self.m,0.0],[0.0,0.0,self.Izz]])
+        d = self.dtype
+        # 刚体质量矩阵
+        self.M_RB = np.array(
+            [[self.m, 0.0, 0.0],
+             [0.0, self.m, 0.0],
+             [0.0, 0.0, self.Izz]], dtype=d
+        )
 
-        self.M_A = -1.0 * np.matrix([[self.xDotU,0.0,0.0],[0.0,self.yDotV,self.yDotR],
-                                     [0.0,self.nDotV,self.nDotR]])
-        
-        self.D = -1.0 * np.matrix([[self.xU,0.0,0.0],[0.0,self.yV,self.yR],
-                                   [0.0,self.nV,self.nR]])
+        # 附加质量矩阵
+        self.M_A = -np.array(
+            [[self.xDotU, 0.0, 0.0],
+             [0.0, self.yDotV, self.yDotR],
+             [0.0, self.nDotV, self.nDotR]], dtype=d
+        )
+
+        # 线性阻尼矩阵
+        self.D = -np.array(
+            [[self.xU, 0.0, 0.0],
+             [0.0, self.yV, self.yR],
+             [0.0, self.nV, self.nR]], dtype=d
+        )
+
+        # 质量矩阵（常量），并预计算逆
+        self.mass_matrix = self.M_RB + self.M_A
+        self.mass_matrix_inv = np.linalg.inv(self.mass_matrix)
+        # 如果你更喜欢 solve，也可以不存 inverse，而是每步用 np.linalg.solve
 
     def compute_step_energy_cost(self):
         # TODO: Revise energy computation
@@ -193,9 +214,11 @@ class Robot:
                                 self.left_thrust,self.right_thrust])
 
     def get_robot_transform(self):
-        # compute transformation from world frame to robot frame
-        R_wr = np.matrix([[np.cos(self.theta),-np.sin(self.theta)],[np.sin(self.theta),np.cos(self.theta)]])
-        t_wr = np.matrix([[self.x],[self.y]])
+        # world -> robot 的旋转和平移
+        c, s = np.cos(self.theta), np.sin(self.theta)
+        R_wr = np.array([[c, -s],
+                         [s,  c]], dtype=self.dtype)
+        t_wr = np.array([self.x, self.y], dtype=self.dtype)
         return R_wr, t_wr
 
     def update_velocity(self,current_velocity=np.zeros(3)):
@@ -231,52 +254,77 @@ class Robot:
         self.compute_motion()
 
     def compute_motion(self):
-        # use 3 DOF ship maneuvering model from chapter 6.5 in Fossen's book
+        # 1) 速度从 world 投影到 robot frame
         velocity_r_b = self.project_to_robot_frame(self.velocity_r[:2])
         velocity_b = self.project_to_robot_frame(self.velocity[:2])
-        u_r = velocity_r_b[0]
-        v_r = velocity_r_b[1]
-        u = velocity_b[0]
-        v = velocity_b[1]
-        r = self.velocity[2]
-        C_RB = np.matrix([[0.0,-self.m*r,0.0],[self.m*r,0.0,0.0],[0.0,0.0,0.0]])
-        C_A = np.matrix([[0.0,0.0,self.yDotV*v_r+self.yDotR*r],[0.0,0.0,-self.xDotU*u_r],
-                         [-self.yDotV*v_r-self.yDotR*r,self.xDotU*u_r,0.0]])
-        D_n = -1.0 * np.matrix([[self.xUU*np.abs(u_r),0.0,0.0],
-                                [0.0,self.yVV*np.abs(v_r)+self.yRV*np.abs(r),self.yVR*np.abs(v_r)+self.yRR*np.abs(r)],
-                                [0.0,self.nVV*np.abs(v_r)+self.nRV*np.abs(r),self.nVR*np.abs(v_r)+self.nRR*np.abs(r)]])
-        N = C_A + self.D + D_n
 
-        # compute propulsion forces and moment
-        F_x_left = self.left_thrust * np.cos(self.left_pos)
-        F_y_left = self.left_thrust * np.sin(self.left_pos)
-        M_x_left = F_x_left * self.width/2
-        M_y_left = -F_y_left * self.length/2
-        
+        u_r, v_r = velocity_r_b[0], velocity_r_b[1]
+        u, v = velocity_b[0], velocity_b[1]
+        r = self.velocity[2]
+
+        d = self.dtype
+
+        # 2) 科氏力 / 附加质量 / 非线性阻尼矩阵
+        C_RB = np.array(
+            [[0.0,      -self.m * r, 0.0],
+             [self.m*r,  0.0,        0.0],
+             [0.0,       0.0,        0.0]], dtype=d
+        )
+
+        C_A = np.array(
+            [[0.0, 0.0, self.yDotV * v_r + self.yDotR * r],
+             [0.0, 0.0, -self.xDotU * u_r],
+             [-self.yDotV * v_r - self.yDotR * r,
+              self.xDotU * u_r,
+              0.0]], dtype=d
+        )
+
+        D_n = -np.array(
+            [[self.xUU * abs(u_r), 0.0, 0.0],
+             [0.0,
+              self.yVV * abs(v_r) + self.yRV * abs(r),
+              self.yVR * abs(v_r) + self.yRR * abs(r)],
+             [0.0,
+              self.nVV * abs(v_r) + self.nRV * abs(r),
+              self.nVR * abs(v_r) + self.nRR * abs(r)]], dtype=d
+        )
+
+        N = C_A + self.D + D_n   # 总的非惯性/阻尼项
+
+        # 3) 推进器产生的力和力矩
+        F_x_left  = self.left_thrust  * np.cos(self.left_pos)
+        F_y_left  = self.left_thrust  * np.sin(self.left_pos)
+        M_x_left  = F_x_left *  self.width / 2.0
+        M_y_left  = -F_y_left * self.length / 2.0
+
         F_x_right = self.right_thrust * np.cos(self.right_pos)
         F_y_right = self.right_thrust * np.sin(self.right_pos)
-        M_x_right = -F_x_right * self.width/2
-        M_y_right = -F_y_right * self.length/2
-        
+        M_x_right = -F_x_right * self.width / 2.0
+        M_y_right = -F_y_right * self.length / 2.0
+
         F_x = F_x_left + F_x_right
         F_y = F_y_left + F_y_right
         M_n = M_x_left + M_y_left + M_x_right + M_y_right
-        tau_p = np.matrix([[F_x],[F_y],[M_n]])
 
-        # compute accelerations
-        A = self.M_RB + self.M_A
-        V = np.matrix([[u,v,r]]).transpose()
-        V_r = np.matrix([[u_r,v_r,r]]).transpose()
-        b = -C_RB*V - N*V_r + tau_p
-        acc = np.linalg.inv(A.transpose()*A)*A.transpose()*b
+        tau_p = np.array([F_x, F_y, M_n], dtype=d)
 
-        # apply accelerations to velocity
-        V_r += acc * self.dt
-        
-        # project velocity to the world frame
-        R_wr,_ = self.get_robot_transform()
-        V_r[:2,:] = R_wr * V_r[:2,:]
-        self.velocity_r = np.squeeze(np.array(V_r))
+        # 4) 计算加速度：mass_matrix * acc = -C_RB V - N V_r + tau_p
+        V = np.array([u, v, r], dtype=d)
+        V_r = np.array([u_r, v_r, r], dtype=d)
+        b = -C_RB @ V - N @ V_r + tau_p
+
+        # （1）用预计算的逆
+        acc = self.mass_matrix_inv @ b
+        # （2）如果不想预计算，也可以：
+        # acc = np.linalg.solve(self.mass_matrix, b)
+
+        # 5) 应用加速度
+        V_r = V_r + acc * self.dt
+
+        # 6) 速度从 robot frame 投影回 world frame
+        R_wr, _ = self.get_robot_transform()
+        v_world = R_wr @ V_r[:2]
+        self.velocity_r = np.array([v_world[0], v_world[1], V_r[2]], dtype=d)
 
     def check_collision(self,obj_x,obj_y,obj_r):
         d = self.compute_distance(obj_x,obj_y,obj_r)
@@ -302,44 +350,38 @@ class Robot:
         
         return True
 
-    def project_to_robot_frame(self,x,is_vector=True):
-        assert isinstance(x,np.ndarray), "the input needs to be an numpy array"
-        assert np.shape(x) == (2,)
-
-        x_r = np.reshape(x,(2,1))
+    def project_to_robot_frame(self, x, is_vector=True):
+        x = np.asarray(x, dtype=self.dtype)
+        assert x.shape == (2,)
 
         R_wr, t_wr = self.get_robot_transform()
-
-        R_rw = np.transpose(R_wr)
-        t_rw = -R_rw * t_wr 
+        R_rw = R_wr.T  # robot <- world
 
         if is_vector:
-            x_r = R_rw * x_r
+            # 速度向量，只做旋转
+            return R_rw @ x
         else:
-            x_r = R_rw * x_r + t_rw
+            # 位置，需要先减去平移再旋转
+            return R_rw @ (x - t_wr)
 
-        x_r.resize((2,))
-        return np.array(x_r)
-    
     def project_ego_to_vehicle_frame(self,vehicle):
-        vehicle_p = np.array(vehicle[:2])
-        vehicle_v = np.array(vehicle[2:4])
+        vehicle_p = np.array(vehicle[:2], dtype=self.dtype)
+        vehicle_v = np.array(vehicle[2:4], dtype=self.dtype)
 
         vehicle_v_angle = np.arctan2(vehicle_v[1],vehicle_v[0])
-        R = np.matrix([[np.cos(vehicle_v_angle),-np.sin(vehicle_v_angle)], \
-                       [np.sin(vehicle_v_angle),np.cos(vehicle_v_angle)]])
-        t = np.matrix([[vehicle_p[0]],[vehicle_p[1]]])
+        c, s = np.cos(vehicle_v_angle), np.sin(vehicle_v_angle)
+        R = np.array([[c, -s],
+                      [s,  c]], dtype=self.dtype)
+        t = np.array([vehicle_p[0], vehicle_p[1]], dtype=self.dtype)
 
         # project ego position to vehicle_frame
-        ego_p_proj = -np.transpose(R) * t
-        ego_p_proj.resize((2,))
+        ego_p_proj = -R.T @ t
 
         # project ego velocity to vehicle_frame
         ego_v = self.project_to_robot_frame(self.velocity[:2])
-        ego_v_proj = np.transpose(R) * np.matrix([[ego_v[0]],[ego_v[1]]])
-        ego_v_proj.resize((2,))
+        ego_v_proj = R.T @ ego_v
 
-        return np.array(ego_p_proj), np.array(ego_v_proj)
+        return ego_p_proj, ego_v_proj
     
     def check_in_left_crossing_zone(self,ego_p_proj,ego_v_proj):
         x_in_range = ((ego_p_proj[0] >= self.left_crossing_zone_x_dim[0]) and (ego_p_proj[0] <= self.left_crossing_zone_x_dim[1]))

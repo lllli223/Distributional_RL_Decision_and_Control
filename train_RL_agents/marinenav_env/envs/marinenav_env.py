@@ -753,7 +753,7 @@ class MarineNavEnv3(gym.Env):
             episode["robots"]["start"].append(list(rob.start))
             episode["robots"]["goal"].append(list(rob.goal))
             episode["robots"]["init_theta"].append(rob.init_theta)
-            episode["robots"]["init_velocity_r"].append(list(rob.init_velocity_r))
+            episode["robots"]["init_velocity_r"].append([float(x) for x in rob.init_velocity_r])
             episode["robots"]["init_left_pos"].append(rob.init_left_pos)
             episode["robots"]["init_right_pos"].append(rob.init_right_pos)
             episode["robots"]["init_left_thrust"].append(rob.init_left_thrust)
