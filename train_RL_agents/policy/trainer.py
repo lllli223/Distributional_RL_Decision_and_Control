@@ -37,7 +37,8 @@ class Trainer():
                  initial_eps=0.6, # IQN
                  final_eps=0.05, # IQN
                  imitation=False,
-                 il_agent=None
+                 il_agent=None,
+                 logger=None
                  ):
         
         self.train_env = train_env
@@ -72,6 +73,14 @@ class Trainer():
         else:
             self.n_envs = 1
             print("Using single environment")
+
+        # Set up logger
+        self.logger = logger
+        if self.logger is not None:
+            log_mode = "vectorized" if self.is_vec_env else "single"
+            self.logger.get_logger().info(
+                f"Trainer initialized with {self.n_envs} environment(s) in {log_mode} mode"
+            )
 
         # Current time step
         self.current_timestep = 0
@@ -142,6 +151,15 @@ class Trainer():
         ep_length = 0
         ep_num = 0
         
+        # Log episode start
+        if self.logger is not None:
+            self.logger.log_episode_start(
+                env_idx=0,
+                episode_num=ep_num,
+                num_robots=len(self.train_env.robots),
+                timestep=self.current_timestep
+            )
+        
         while self.current_timestep <= total_timesteps:
             
             # start_all = time.time()
@@ -211,6 +229,17 @@ class Trainer():
                 if rob.collision or rob.reach_goal:
                     rob.deactivated = True
                     ep_deactivated_t[i] = ep_length
+                    
+                    # Log robot deactivation
+                    if self.logger is not None:
+                        reason = "collision" if rob.collision else "goal_reached"
+                        self.logger.log_robot_deactivation(
+                            env_idx=0,
+                            robot_idx=i,
+                            reason=reason,
+                            timestep=self.current_timestep,
+                            episode_step=ep_length
+                        )
 
             end_episode = (ep_length >= 1000) or self.train_env.check_all_deactivated()
             
@@ -249,10 +278,32 @@ class Trainer():
                     
                     # save the latest models
                     self.rl_agent.save_latest_model(eval_log_path)
+                    
+                    # Log checkpoint save
+                    if self.logger is not None:
+                        self.logger.log_checkpoint(
+                            timestep=self.current_timestep,
+                            checkpoint_path=eval_log_path
+                        )
 
                 # self.learning_timestep += 1
 
             if end_episode:
+                # Log episode end
+                if self.logger is not None:
+                    success_info = {
+                        i: (rob.reach_goal and not rob.collision)
+                        for i, rob in enumerate(self.train_env.robots)
+                    }
+                    self.logger.log_episode_end(
+                        env_idx=0,
+                        episode_num=ep_num,
+                        episode_length=ep_length,
+                        rewards=ep_rewards,
+                        success_info=success_info,
+                        timestep=self.current_timestep
+                    )
+                
                 ep_num += 1
                 
                 if verbose:
@@ -286,6 +337,15 @@ class Trainer():
                 ep_rewards = np.zeros(len(self.train_env.robots))
                 ep_deactivated_t = [-1]*len(self.train_env.robots)
                 ep_length = 0
+                
+                # Log new episode start
+                if self.logger is not None:
+                    self.logger.log_episode_start(
+                        env_idx=0,
+                        episode_num=ep_num,
+                        num_robots=len(self.train_env.robots),
+                        timestep=self.current_timestep
+                    )
             else:
                 states = next_states
                 ep_length += 1
@@ -329,6 +389,15 @@ class Trainer():
             ep_deactivated_t_list.append([-1] * num_robots)
             ep_length_list.append(0)
             ep_num_list.append(0)
+            
+            # Log episode start for each environment
+            if self.logger is not None:
+                self.logger.log_episode_start(
+                    env_idx=env_idx,
+                    episode_num=0,
+                    num_robots=num_robots,
+                    timestep=self.current_timestep
+                )
         
         while self.current_timestep <= total_timesteps:
             
@@ -416,6 +485,17 @@ class Trainer():
                     
                     if robots_info[i]['collision'] or robots_info[i]['reach_goal']:
                         ep_deactivated_t[i] = ep_length
+                        
+                        # Log robot deactivation
+                        if self.logger is not None:
+                            reason = "collision" if robots_info[i]['collision'] else "goal_reached"
+                            self.logger.log_robot_deactivation(
+                                env_idx=env_idx,
+                                robot_idx=i,
+                                reason=reason,
+                                timestep=self.current_timestep,
+                                episode_step=ep_length
+                            )
                 
                 # Check if episode ended for this environment
                 # Get environment info
@@ -425,6 +505,21 @@ class Trainer():
                 end_episode = (ep_length >= 1000) or env_info['check_all_deactivated']
                 
                 if end_episode:
+                    # Log episode end
+                    if self.logger is not None:
+                        success_info = {
+                            i: (robots_info[i]['reach_goal'] and not robots_info[i]['collision'])
+                            for i in range(len(robots_info))
+                        }
+                        self.logger.log_episode_end(
+                            env_idx=env_idx,
+                            episode_num=ep_num_list[env_idx],
+                            episode_length=ep_length,
+                            rewards=ep_rewards,
+                            success_info=success_info,
+                            timestep=self.current_timestep
+                        )
+                    
                     ep_num_list[env_idx] += 1
                     
                     if verbose and env_idx == 0:  # Only print info for first env to avoid spam
@@ -455,6 +550,15 @@ class Trainer():
                     ep_rewards_list[env_idx] = np.zeros(len(states))
                     ep_deactivated_t_list[env_idx] = [-1] * len(states)
                     ep_length_list[env_idx] = 0
+                    
+                    # Log new episode start
+                    if self.logger is not None:
+                        self.logger.log_episode_start(
+                            env_idx=env_idx,
+                            episode_num=ep_num_list[env_idx],
+                            num_robots=len(states),
+                            timestep=self.current_timestep
+                        )
                 else:
                     ep_length_list[env_idx] += 1
             
@@ -489,6 +593,13 @@ class Trainer():
                     
                     # save the latest models
                     self.rl_agent.save_latest_model(eval_log_path)
+                    
+                    # Log checkpoint save
+                    if self.logger is not None:
+                        self.logger.log_checkpoint(
+                            timestep=self.current_timestep,
+                            checkpoint_path=eval_log_path
+                        )
             
             self.current_timestep += 1
 
@@ -607,6 +718,16 @@ class Trainer():
             print(f"Avg time: {avg_t:.2f}")
             print(f"Avg energy: {avg_e:.2f}")
         print(f"++++++++ Evaluation Info ++++++++\n")
+        
+        # Log evaluation results
+        if self.logger is not None:
+            self.logger.log_evaluation(
+                timestep=self.current_timestep,
+                avg_reward=avg_r,
+                success_rate=success_rate,
+                avg_time=avg_t,
+                avg_energy=avg_e
+            )
 
         self.eval_timesteps.append(self.current_timestep)
         self.eval_observations.append(observations_data)

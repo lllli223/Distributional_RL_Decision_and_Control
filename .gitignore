@@ -13,3 +13,6 @@ test*
 experiment*
 vrx_experiment_results/
 vrx_visualize_episodes/
+*.log
+logs/
+__pycache__/

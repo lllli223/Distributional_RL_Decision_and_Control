@@ -6,9 +6,10 @@ in parallel subprocesses, allowing for efficient data collection across multiple
 """
 import multiprocessing as mp
 import cloudpickle
+import logging
 
 
-def worker(remote, parent_remote, env_fn_wrapper):
+def worker(remote, parent_remote, env_fn_wrapper, log_queue=None):
     """
     Worker function that runs in a subprocess to handle environment interactions.
     
@@ -16,8 +17,24 @@ def worker(remote, parent_remote, env_fn_wrapper):
         remote: The subprocess-side Pipe connection
         parent_remote: The parent-side Pipe connection (closed in subprocess)
         env_fn_wrapper: A callable that returns an environment instance
+        log_queue: Optional multiprocessing queue for logging
     """
     parent_remote.close()
+    
+    # Configure worker logger if log_queue is provided
+    logger = None
+    if log_queue is not None:
+        try:
+            logger = logging.getLogger("worker")
+            logger.setLevel(logging.INFO)
+            logger.handlers.clear()
+            queue_handler = logging.handlers.QueueHandler(log_queue)
+            logger.addHandler(queue_handler)
+            logger.propagate = False
+        except Exception as e:
+            # If logging setup fails, continue without logging
+            logger = None
+    
     env = cloudpickle.loads(env_fn_wrapper)()
     try:
         while True:
@@ -77,18 +94,20 @@ class SubprocVecEnv:
     
     Args:
         env_fns: List of functions that create environment instances
+        log_queue: Optional multiprocessing queue for logging from worker processes
     """
     
-    def __init__(self, env_fns):
+    def __init__(self, env_fns, log_queue=None):
         self.n_envs = len(env_fns)
         self.remotes, self.work_remotes = zip(*[mp.Pipe() for _ in range(self.n_envs)])
+        self.log_queue = log_queue
         
         # Serialize environment creation functions
         env_fns_pickled = [cloudpickle.dumps(fn) for fn in env_fns]
         
         self.ps = []
         for work_remote, remote, env_fn in zip(self.work_remotes, self.remotes, env_fns_pickled):
-            p = mp.Process(target=worker, args=(work_remote, remote, env_fn))
+            p = mp.Process(target=worker, args=(work_remote, remote, env_fn, log_queue))
             p.daemon = True
             p.start()
             work_remote.close()
@@ -139,7 +158,7 @@ class SubprocVecEnv:
         return [remote.recv() for remote in self.remotes]
 
     def close(self):
-        """Close all subprocess environments."""
+        """Close all subprocess environments and clean up logging."""
         if self.closed:
             return
         
@@ -153,6 +172,9 @@ class SubprocVecEnv:
             p.join(timeout=5)
             if p.is_alive():
                 p.terminate()
+        
+        # Clean up logging queue if it was provided
+        # Note: The actual queue cleanup is handled by MultiprocessLogger.stop()
         
         self.closed = True
 
