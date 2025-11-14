@@ -106,7 +106,7 @@ def run_trial(device,params):
     eval_env = MarineNavEnv3(seed=253,is_eval_env=True)
 
     # create RL agent (and IL agent if using imitation learning)
-    rl_agent = Agent(device=device,seed=params["seed"]+100,agent_type=params["agent_type"])
+    rl_agent = Agent(device=device,seed=params["seed"]+100,agent_type=params["agent_type"], BATCH_SIZE=params["batch_size"])
 
     if "load_model" in params:
         rl_agent.load_model(params["load_model"],device)
@@ -118,7 +118,10 @@ def run_trial(device,params):
                     eval_schedule=params["eval_schedule"],
                     rl_agent=rl_agent,
                     imitation=params["imitation_learning"],
-                    il_agent=il_agent
+                    il_agent=il_agent,
+                    UPDATE_EVERY=params["update_every"],
+                    learning_starts=params["learning_starts"],
+                    target_update_interval=params["target_update_interval"]
                     )
     
     trainer.save_eval_config(exp_dir)

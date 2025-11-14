@@ -384,10 +384,16 @@ class Robot:
 
         base_1 = obj[4] + 1.0
         dist = np.linalg.norm(obj_p)
-        add_angle_1 = np.arcsin(base_1/dist)
+        
+        # Ensure dist is greater than base_1 to avoid sqrt of negative number
+        if dist <= base_1:
+            # Object is too close, use a safe fallback angle
+            dist = base_1 + 1e-6  # Add small epsilon to avoid division by zero
+        
+        add_angle_1 = np.arcsin(np.clip(base_1/dist, -1.0, 1.0))  # Clip to valid arcsin range
 
-        tangent_len = np.sqrt(dist**2-base_1**2)
-        add_angle_2 = np.arctan2(self.r,tangent_len)
+        tangent_len = np.sqrt(np.maximum(dist**2 - base_1**2, 0.0))  # Ensure non-negative
+        add_angle_2 = np.arctan2(self.r, tangent_len) if tangent_len > 0 else 0.0
 
         # desired velocity direction according to COLREGs
         desired_dir = self.wrap_to_pi(obj_p_angle + add_angle_1 + add_angle_2)

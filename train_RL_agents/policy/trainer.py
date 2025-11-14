@@ -336,17 +336,24 @@ class Trainer():
                 eps = self.linear_eps(total_timesteps)
             
             # Gather actions for all robots across all environments
-            actions_list = []  # One actions array per environment
+            # Collect all states for batch inference
+            all_states = []
+            state_indices = []  # Track which env and robot each state belongs to
             
             for env_idx, states in enumerate(states_list):
-                actions = []
-                for i, state in enumerate(states):
-                    # Check if robot is deactivated (we'll need to get this info from env)
-                    # For now, collect actions for all robots
-                    
-                    if self.imitation:
-                        action = self.il_agent.act(state)
-                    else:
+                for robot_idx, state in enumerate(states):
+                    all_states.append(state)
+                    state_indices.append((env_idx, robot_idx))
+            
+            # Batch inference for all states at once
+            if len(all_states) > 0:
+                if self.imitation:
+                    all_actions = [self.il_agent.act(state) for state in all_states]
+                else:
+                    # TODO: Implement true batch inference in agent methods
+                    # For now, still iterate but at least it's cleaner
+                    all_actions = []
+                    for state in all_states:
                         if self.rl_agent.agent_type == "AC-IQN":
                             action = self.rl_agent.act_ac_iqn(state, eps, use_eval=False)
                         elif self.rl_agent.agent_type == "IQN":
@@ -361,10 +368,12 @@ class Trainer():
                             action = self.rl_agent.act_rainbow(state, eps, use_eval=False)
                         else:
                             raise RuntimeError("Agent type not implemented!")
-                    
-                    actions.append(action)
-                
-                actions_list.append(actions)
+                        all_actions.append(action)
+            
+            # Reorganize actions back into per-environment lists
+            actions_list = [[] for _ in range(self.n_envs)]
+            for action, (env_idx, robot_idx) in zip(all_actions, state_indices):
+                actions_list[env_idx].append(action)
             
             # Execute actions in all training environments
             is_continuous_action = False
