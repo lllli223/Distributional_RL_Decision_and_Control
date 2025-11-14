@@ -1,0 +1,25 @@
+{
+    "seed":[0],
+    "total_timesteps":1000,
+    "eval_freq":500,
+    "num_parallel_envs":2,
+    "save_dir":"./training_data_parallel_test2",
+    "training_schedule":
+    {
+        "timesteps":[0],
+        "num_robots":[3],
+        "num_cores":[0],
+        "num_obstacles":[0],
+        "min_start_goal_dis":[30.0]
+    },
+    "eval_schedule":
+    {
+        "num_episodes": [2],
+        "num_robots":[3],
+        "num_cores":[0],
+        "num_obstacles":[0],
+        "min_start_goal_dis":[30.0]
+    },
+    "imitation_learning":false,
+    "agent_type":"IQN"
+}

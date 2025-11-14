@@ -58,6 +58,21 @@ class Trainer():
         if self.imitation:
             assert self.il_agent is not None, "Imitation Learning agent not given!"
 
+        # Check if we're using vectorized environments
+        # Import here to avoid circular dependency
+        try:
+            from parallel_env import SubprocVecEnv
+            self.is_vec_env = isinstance(train_env, SubprocVecEnv)
+        except ImportError:
+            self.is_vec_env = False
+        
+        if self.is_vec_env:
+            self.n_envs = train_env.n_envs
+            print(f"Using vectorized environment with {self.n_envs} parallel environments")
+        else:
+            self.n_envs = 1
+            print("Using single environment")
+
         # Current time step
         self.current_timestep = 0
 
@@ -100,6 +115,17 @@ class Trainer():
             json.dump(_to_serializable(self.eval_config), f)
 
     def learn(self,
+              total_timesteps,
+              eval_freq,
+              eval_log_path,
+              verbose=True):
+        
+        if self.is_vec_env:
+            return self._learn_vec_env(total_timesteps, eval_freq, eval_log_path, verbose)
+        else:
+            return self._learn_single_env(total_timesteps, eval_freq, eval_log_path, verbose)
+
+    def _learn_single_env(self,
               total_timesteps,
               eval_freq,
               eval_log_path,
@@ -279,6 +305,183 @@ class Trainer():
             return self.initial_eps + r * (self.final_eps - self.initial_eps)
         else:
             return self.final_eps
+
+    def _learn_vec_env(self,
+              total_timesteps,
+              eval_freq,
+              eval_log_path,
+              verbose=True):
+        """Learning loop for vectorized environments (multiple parallel environments)"""
+        
+        # Reset all environments
+        states_list = self.train_env.reset()  # List of state arrays, one per env
+        
+        # Track episode state for each environment
+        ep_rewards_list = []
+        ep_deactivated_t_list = []
+        ep_length_list = []
+        ep_num_list = []
+        
+        # Initialize episode tracking for each environment
+        for env_idx, states in enumerate(states_list):
+            num_robots = len(states)
+            ep_rewards_list.append(np.zeros(num_robots))
+            ep_deactivated_t_list.append([-1] * num_robots)
+            ep_length_list.append(0)
+            ep_num_list.append(0)
+        
+        while self.current_timestep <= total_timesteps:
+            
+            if not self.imitation:
+                eps = self.linear_eps(total_timesteps)
+            
+            # Gather actions for all robots across all environments
+            actions_list = []  # One actions array per environment
+            
+            for env_idx, states in enumerate(states_list):
+                actions = []
+                for i, state in enumerate(states):
+                    # Check if robot is deactivated (we'll need to get this info from env)
+                    # For now, collect actions for all robots
+                    
+                    if self.imitation:
+                        action = self.il_agent.act(state)
+                    else:
+                        if self.rl_agent.agent_type == "AC-IQN":
+                            action = self.rl_agent.act_ac_iqn(state, eps, use_eval=False)
+                        elif self.rl_agent.agent_type == "IQN":
+                            action, _, _ = self.rl_agent.act_iqn(state, eps, use_eval=False)
+                        elif self.rl_agent.agent_type == "DDPG":
+                            action = self.rl_agent.act_ddpg(state, eps, use_eval=False)
+                        elif self.rl_agent.agent_type == "DQN":
+                            action = self.rl_agent.act_dqn(state, eps, use_eval=False)
+                        elif self.rl_agent.agent_type == "SAC":
+                            action = self.rl_agent.act_sac(state, eps, use_eval=False)
+                        elif self.rl_agent.agent_type == "Rainbow":
+                            action = self.rl_agent.act_rainbow(state, eps, use_eval=False)
+                        else:
+                            raise RuntimeError("Agent type not implemented!")
+                    
+                    actions.append(action)
+                
+                actions_list.append(actions)
+            
+            # Execute actions in all training environments
+            is_continuous_action = False
+            if self.rl_agent.agent_type in ["AC-IQN", "DDPG", "SAC"]:
+                is_continuous_action = True
+            
+            next_states_list, rewards_list, dones_list, infos_list = self.train_env.step(
+                actions_list, is_continuous_action
+            )
+            
+            # Get robot info from all environments
+            robots_info_list = self.train_env.get_robots_info()
+            
+            # Process experiences from all environments
+            for env_idx in range(self.n_envs):
+                states = states_list[env_idx]
+                actions = actions_list[env_idx]
+                rewards = rewards_list[env_idx]
+                next_states = next_states_list[env_idx]
+                dones = dones_list[env_idx]
+                infos = infos_list[env_idx]
+                robots_info = robots_info_list[env_idx]
+                
+                ep_length = ep_length_list[env_idx]
+                ep_rewards = ep_rewards_list[env_idx]
+                ep_deactivated_t = ep_deactivated_t_list[env_idx]
+                
+                # Save experience in replay memory
+                for i in range(len(states)):
+                    if robots_info[i]['deactivated']:
+                        continue
+                    
+                    ep_rewards[i] += self.rl_agent.GAMMA ** ep_length * rewards[i]
+                    
+                    if self.rl_agent.training:
+                        if self.rl_agent.agent_type == "Rainbow":
+                            self.rl_agent.memory.append(states[i], actions[i], rewards[i], dones[i])
+                        else:
+                            self.rl_agent.memory.add((states[i], actions[i], rewards[i], next_states[i], dones[i]))
+                    
+                    if robots_info[i]['collision'] or robots_info[i]['reach_goal']:
+                        ep_deactivated_t[i] = ep_length
+                
+                # Check if episode ended for this environment
+                # Get environment info
+                env_info_list = self.train_env.get_env_info()
+                env_info = env_info_list[env_idx]
+                
+                end_episode = (ep_length >= 1000) or env_info['check_all_deactivated']
+                
+                if end_episode:
+                    ep_num_list[env_idx] += 1
+                    
+                    if verbose and env_idx == 0:  # Only print info for first env to avoid spam
+                        if self.imitation:
+                            print("======== IL Episode Info ========")
+                        else:
+                            print("======== RL Episode Info ========")
+                        
+                        print(f"Env {env_idx} - current ep_length: ", ep_length)
+                        print(f"Env {env_idx} - current ep_num: ", ep_num_list[env_idx])
+                        
+                        if not self.imitation:
+                            print("current exploration rate: ", eps)
+                        
+                        print("current timesteps: ", self.current_timestep)
+                        print("total timesteps: ", total_timesteps)
+                        print("======== Episode Info ========\n")
+                        print("======== Robots Info ========")
+                        for i in range(len(infos)):
+                            info = infos[i]["state"]
+                            if "deactivated after collision" in info or "deactivated after reaching goal" in info:
+                                print(f"Robot {i} ep reward: {ep_rewards[i]:.2f}, {info} at step {ep_deactivated_t[i]}")
+                            else:
+                                print(f"Robot {i} ep reward: {ep_rewards[i]:.2f}, {info}")
+                        print("======== Robots Info ========\n")
+                    
+                    # Reset episode tracking for this environment
+                    ep_rewards_list[env_idx] = np.zeros(len(states))
+                    ep_deactivated_t_list[env_idx] = [-1] * len(states)
+                    ep_length_list[env_idx] = 0
+                else:
+                    ep_length_list[env_idx] += 1
+            
+            # Update states for next iteration
+            states_list = next_states_list
+            
+            # Learn, update and evaluate models after learning_starts time step
+            if self.current_timestep >= self.learning_starts:
+                
+                if not self.rl_agent.training:
+                    continue
+                
+                # Learn every UPDATE_EVERY time steps
+                if self.current_timestep % self.UPDATE_EVERY == 0:
+                    num_elements = self.rl_agent.memory.transitions.num_elements() if self.rl_agent.agent_type == \
+                                   "Rainbow" else self.rl_agent.memory.size()
+                    
+                    if num_elements > self.rl_agent.BATCH_SIZE:
+                        self.rl_agent.train()
+                
+                # Update the target model every target_update_interval time steps
+                if self.current_timestep % self.target_update_interval == 0:
+                    self.rl_agent.soft_update()
+                
+                # Evaluate learning agents every eval_freq time steps
+                if self.current_timestep == self.learning_starts or self.current_timestep % eval_freq == 0:
+                    self.evaluation()
+                    self.save_evaluation(eval_log_path)
+                    
+                    if not self.rl_agent.training:
+                        continue
+                    
+                    # save the latest models
+                    self.rl_agent.save_latest_model(eval_log_path)
+            
+            self.current_timestep += 1
 
     def evaluation(self):
         """Evaluate performance of the RL agent
