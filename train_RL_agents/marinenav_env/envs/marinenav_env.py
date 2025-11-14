@@ -4,6 +4,7 @@ import marinenav_env.envs.utils.robot as robot
 import gym
 import json
 import copy
+from marinenav_env.envs.utils.fast_dynamics import compute_velocity_from_cores_numba
 
 class Core:
 
@@ -147,6 +148,9 @@ class MarineNavEnv3(gym.Env):
         # KDTree storing vortex core center positions
         if centers is not None:
             self.core_centers = scipy.spatial.KDTree(centers)
+        
+        # Prepare arrays for Numba-accelerated velocity computation
+        self._prepare_core_arrays()
 
         ##### generate static obstacles with random position and size
         if num_obs > 0:
@@ -456,40 +460,43 @@ class MarineNavEnv3(gym.Env):
         
         return True
 
+    def _prepare_core_arrays(self):
+        """Prepare numpy arrays for Numba-accelerated velocity computation."""
+        if len(self.cores) == 0:
+            self.core_x_array = np.empty(0, dtype=np.float64)
+            self.core_y_array = np.empty(0, dtype=np.float64)
+            self.core_gamma_array = np.empty(0, dtype=np.float64)
+            self.core_clockwise_array = np.empty(0, dtype=np.float64)
+            self.two_pi_r_sq = 2.0 * np.pi * self.r * self.r
+            return
+        
+        n = len(self.cores)
+        self.core_x_array = np.empty(n, dtype=np.float64)
+        self.core_y_array = np.empty(n, dtype=np.float64)
+        self.core_gamma_array = np.empty(n, dtype=np.float64)
+        self.core_clockwise_array = np.empty(n, dtype=np.float64)
+        
+        for i, core in enumerate(self.cores):
+            self.core_x_array[i] = core.x
+            self.core_y_array[i] = core.y
+            self.core_gamma_array[i] = core.Gamma
+            self.core_clockwise_array[i] = 1.0 if core.clockwise else -1.0
+        
+        self.two_pi_r_sq = 2.0 * np.pi * self.r * self.r
+
     def get_velocity(self,x:float, y:float):
         if len(self.cores) == 0:
             return np.zeros(3)
         
-        # sort the vortices according to their distance to the query point
-        d, idx = self.core_centers.query(np.array([x,y]),k=len(self.cores))
-        if isinstance(idx,np.int64):
-            idx = [idx]
-
-        v_radial_set = []
-        v_velocity = np.zeros((2,1))
-        for i in list(idx): 
-            core = self.cores[i]
-            v_radial = np.matrix([[core.x-x],[core.y-y]])
-
-            for v in v_radial_set:
-                project = np.transpose(v) * v_radial
-                if project[0,0] > 0:
-                    # if the core is in the outter area of a checked core (wrt the query position),
-                    # assume that it has no influence the velocity of the query position
-                    continue
-            
-            v_radial_set.append(v_radial)
-            dis = np.linalg.norm(v_radial)
-            v_radial /= dis
-            if core.clockwise:
-                rotation = np.matrix([[0., -1.],[1., 0]])
-            else:
-                rotation = np.matrix([[0., 1.],[-1., 0]])
-            v_tangent = rotation * v_radial
-            speed = self.compute_speed(core.Gamma,dis)
-            v_velocity += v_tangent * speed
+        # Use Numba-accelerated computation
+        vx, vy = compute_velocity_from_cores_numba(
+            x, y,
+            self.core_x_array, self.core_y_array,
+            self.core_gamma_array, self.core_clockwise_array,
+            self.r, self.two_pi_r_sq
+        )
         
-        return np.array([v_velocity[0,0], v_velocity[1,0], 0.0])
+        return np.array([vx, vy, 0.0])
 
     def get_velocity_test(self,x:float, y:float):
         v = np.ones(2)
