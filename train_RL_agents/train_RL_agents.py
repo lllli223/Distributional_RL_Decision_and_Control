@@ -9,6 +9,7 @@ from marinenav_env.envs.marinenav_env import MarineNavEnv3
 from policy.agent import Agent
 from policy.trainer import Trainer
 from parallel_env import SubprocVecEnv
+from multiprocess_logger import MultiprocessLogger
 
 parser = argparse.ArgumentParser(description="Train IQN model")
 
@@ -35,6 +36,12 @@ parser.add_argument(
     type=str,
     default="cpu",
     help="device to run all subprocesses, could only specify 1 device in each run"
+)
+parser.add_argument(
+    "--enable-logging",
+    dest="enable_logging",
+    action="store_true",
+    help="enable multiprocess-safe logging to track training progress"
 )
 
 def product(*args, repeat=1):
@@ -81,54 +88,76 @@ def run_trial(device,params):
     with open(param_file, 'w+') as outfile:
         json.dump(params, outfile)
     
-    # create training and evaluation environments
-    # Check if parallel environments are requested
-    num_parallel_envs = params.get("num_parallel_envs", 1)
+    # Create logger if logging is enabled
+    logger = None
+    if params.get("enable_logging", False):
+        log_dir = os.path.join(exp_dir, "logs")
+        logger = MultiprocessLogger(log_dir=log_dir, name="training")
+        logger.start()
+        print(f"Logging enabled. Logs will be saved to: {log_dir}")
     
-    if num_parallel_envs > 1:
-        # Create vectorized environment with multiple parallel environments
-        def make_env(seed, schedule):
-            def _thunk():
-                return MarineNavEnv3(seed=seed, schedule=schedule)
-            return _thunk
+    try:
+        # create training and evaluation environments
+        # Check if parallel environments are requested
+        num_parallel_envs = params.get("num_parallel_envs", 1)
         
-        env_fns = [
-            make_env(params["seed"] + i * 1000, params["training_schedule"]) 
-            for i in range(num_parallel_envs)
-        ]
-        train_env = SubprocVecEnv(env_fns)
-        print(f"Created {num_parallel_envs} parallel training environments")
-    else:
-        # Single environment (original behavior)
-        train_env = MarineNavEnv3(seed=params["seed"],schedule=params["training_schedule"])
-        print("Using single training environment")
+        if num_parallel_envs > 1:
+            # Create vectorized environment with multiple parallel environments
+            def make_env(seed, schedule):
+                def _thunk():
+                    return MarineNavEnv3(seed=seed, schedule=schedule)
+                return _thunk
+            
+            env_fns = [
+                make_env(params["seed"] + i * 1000, params["training_schedule"]) 
+                for i in range(num_parallel_envs)
+            ]
+            # Pass log queue if logger is enabled
+            log_queue = logger.log_queue if logger is not None else None
+            train_env = SubprocVecEnv(env_fns, log_queue=log_queue)
+            print(f"Created {num_parallel_envs} parallel training environments")
+        else:
+            # Single environment (original behavior)
+            train_env = MarineNavEnv3(seed=params["seed"],schedule=params["training_schedule"])
+            print("Using single training environment")
 
-    eval_env = MarineNavEnv3(seed=253,is_eval_env=True)
+        eval_env = MarineNavEnv3(seed=253,is_eval_env=True)
 
-    # create RL agent (and IL agent if using imitation learning)
-    rl_agent = Agent(device=device,seed=params["seed"]+100,agent_type=params["agent_type"], BATCH_SIZE=params["batch_size"])
+        # create RL agent (and IL agent if using imitation learning)
+        rl_agent = Agent(device=device,seed=params["seed"]+100,agent_type=params["agent_type"], BATCH_SIZE=params["batch_size"])
 
-    if "load_model" in params:
-        rl_agent.load_model(params["load_model"],device)
+        if "load_model" in params:
+            rl_agent.load_model(params["load_model"],device)
 
-    il_agent = None
+        il_agent = None
+        
+        trainer = Trainer(train_env=train_env,
+                        eval_env=eval_env,
+                        eval_schedule=params["eval_schedule"],
+                        rl_agent=rl_agent,
+                        imitation=params["imitation_learning"],
+                        il_agent=il_agent,
+                        UPDATE_EVERY=params["update_every"],
+                        learning_starts=params["learning_starts"],
+                        target_update_interval=params["target_update_interval"],
+                        logger=logger
+                        )
+        
+        trainer.save_eval_config(exp_dir)
+
+        trainer.learn(total_timesteps=params["total_timesteps"],
+                      eval_freq=params["eval_freq"],
+                      eval_log_path=exp_dir)
+        
+        # Close vectorized environment if used
+        if num_parallel_envs > 1:
+            train_env.close()
     
-    trainer = Trainer(train_env=train_env,
-                    eval_env=eval_env,
-                    eval_schedule=params["eval_schedule"],
-                    rl_agent=rl_agent,
-                    imitation=params["imitation_learning"],
-                    il_agent=il_agent,
-                    UPDATE_EVERY=params["update_every"],
-                    learning_starts=params["learning_starts"],
-                    target_update_interval=params["target_update_interval"]
-                    )
-    
-    trainer.save_eval_config(exp_dir)
-
-    trainer.learn(total_timesteps=params["total_timesteps"],
-                  eval_freq=params["eval_freq"],
-                  eval_log_path=exp_dir)
+    finally:
+        # Stop logger if it was created
+        if logger is not None:
+            logger.stop()
+            print("Logging stopped and files closed")
 
 if __name__ == "__main__":
     args = parser.parse_args()
@@ -147,6 +176,7 @@ if __name__ == "__main__":
             param["training_time"]=timestamp
             param["training_schedule"]=training_schedule
             param["eval_schedule"]=eval_schedule
+            param["enable_logging"]=args.enable_logging
             
             run_trial(args.device,param)
     else:
@@ -155,6 +185,7 @@ if __name__ == "__main__":
                 param["training_time"]=timestamp
                 param["training_schedule"]=training_schedule
                 param["eval_schedule"]=eval_schedule
+                param["enable_logging"]=args.enable_logging
 
                 pool.apply_async(run_trial,(args.device,param))
             
