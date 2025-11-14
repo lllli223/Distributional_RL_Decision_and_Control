@@ -8,6 +8,7 @@ import numpy as np
 from marinenav_env.envs.marinenav_env import MarineNavEnv3
 from policy.agent import Agent
 from policy.trainer import Trainer
+from parallel_env import SubprocVecEnv
 
 parser = argparse.ArgumentParser(description="Train IQN model")
 
@@ -81,7 +82,26 @@ def run_trial(device,params):
         json.dump(params, outfile)
     
     # create training and evaluation environments
-    train_env = MarineNavEnv3(seed=params["seed"],schedule=params["training_schedule"])
+    # Check if parallel environments are requested
+    num_parallel_envs = params.get("num_parallel_envs", 1)
+    
+    if num_parallel_envs > 1:
+        # Create vectorized environment with multiple parallel environments
+        def make_env(seed, schedule):
+            def _thunk():
+                return MarineNavEnv3(seed=seed, schedule=schedule)
+            return _thunk
+        
+        env_fns = [
+            make_env(params["seed"] + i * 1000, params["training_schedule"]) 
+            for i in range(num_parallel_envs)
+        ]
+        train_env = SubprocVecEnv(env_fns)
+        print(f"Created {num_parallel_envs} parallel training environments")
+    else:
+        # Single environment (original behavior)
+        train_env = MarineNavEnv3(seed=params["seed"],schedule=params["training_schedule"])
+        print("Using single training environment")
 
     eval_env = MarineNavEnv3(seed=253,is_eval_env=True)
 

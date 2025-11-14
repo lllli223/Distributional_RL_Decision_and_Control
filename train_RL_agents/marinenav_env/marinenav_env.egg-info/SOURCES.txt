@@ -1,6 +1,7 @@
 setup.py
 envs/__init__.py
 envs/marinenav_env.py
+envs/utils/fast_dynamics.py
 envs/utils/robot.py
 marinenav_env.egg-info/PKG-INFO
 marinenav_env.egg-info/SOURCES.txt
